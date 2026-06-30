@@ -12,6 +12,7 @@ import { createErrorResult, parseUpstreamError, formatProviderError } from "../u
 import { HTTP_STATUS } from "../config/runtimeConfig.js";
 import { handleBypassRequest } from "../utils/bypassHandler.js";
 import { trackPendingRequest, appendRequestLog, saveRequestDetail } from "@/lib/usageDb.js";
+import { acquireSlot, releaseSlot, getConcurrencyLimit, ConcurrencyGateTimeoutError } from "../services/concurrencyGate.js";
 import { getExecutor } from "../executors/index.js";
 import { buildRequestDetail, extractRequestConfig } from "./chatCore/requestDetail.js";
 import { handleForcedSSEToJson } from "./chatCore/sseToJsonHandler.js";
@@ -34,7 +35,7 @@ import { prefetchRemoteImages } from "../translator/concerns/prefetch.js";
  * @param {object} options.credentials - Provider credentials
  * @param {string} options.sourceFormatOverride - Override detected source format (e.g. "openai-responses")
  */
-export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, sourceFormatOverride, providerThinking }) {
+export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, sourceFormatOverride, providerThinking, providerConcurrencyLimit }) {
   const { provider, model } = modelInfo;
   const requestStartTime = Date.now();
 
@@ -192,12 +193,20 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   const msgCount = translatedBody.messages?.length || translatedBody.input?.length || translatedBody.contents?.length || translatedBody.request?.contents?.length || 0;
   log?.debug?.("REQUEST", `${provider.toUpperCase()} | ${model} | ${msgCount} msgs`);
 
+  // --- Per-provider concurrency gate (declaration before streamController closures) ---
+  const concurrencyLimit = getConcurrencyLimit(provider, providerConcurrencyLimit);
+  let slotAcquired = false;
+
   const streamController = createStreamController({
     onDisconnect: (reason) => {
       trackPendingRequest(model, provider, connectionId, false);
+      if (slotAcquired) releaseSlot(provider);
       if (onDisconnect) onDisconnect(reason);
     },
-    onError: () => trackPendingRequest(model, provider, connectionId, false),
+    onError: () => {
+      trackPendingRequest(model, provider, connectionId, false);
+      if (slotAcquired) releaseSlot(provider);
+    },
     log, provider, model
   });
 
@@ -236,6 +245,25 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
 
   // Execute request
   let providerResponse, providerUrl, providerHeaders, finalBody;
+
+  // --- Per-provider concurrency gate ---
+  // Acquire a slot before sending the upstream request.  This proactively
+  // limits concurrent in-flight requests per provider, preventing 429s before
+  // they happen.  If the slot can't be acquired within the timeout, return 503.
+  if (concurrencyLimit > 0) {
+    try {
+      await acquireSlot(provider, concurrencyLimit);
+      slotAcquired = true;
+      log?.debug?.("CONCURRENCY", `${provider} | slot acquired (${concurrencyLimit} max)`);
+    } catch (e) {
+      if (e instanceof ConcurrencyGateTimeoutError) {
+        log?.warn?.("CONCURRENCY", `${provider} | gate timeout after ${e.timeoutMs}ms (${e.limit} max)`);
+        return createErrorResult(HTTP_STATUS.SERVICE_UNAVAILABLE, e.message);
+      }
+      throw e;
+    }
+  }
+
   try {
     const result = await executor.execute({ model, body: translatedBody, stream, credentials, signal: streamController.signal, log, proxyOptions });
     providerResponse = result.response;
@@ -245,6 +273,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     reqLogger.logTargetRequest(providerUrl, providerHeaders, finalBody);
   } catch (error) {
     trackPendingRequest(model, provider, connectionId, false, true);
+    if (slotAcquired) releaseSlot(provider);
     appendRequestLog({ model, provider, connectionId, status: `FAILED ${error.name === "AbortError" ? 499 : HTTP_STATUS.BAD_GATEWAY}` }).catch(() => { });
     saveRequestDetail(buildRequestDetail({
       provider, model, connectionId,
@@ -290,6 +319,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   // Provider returned error
   if (!providerResponse.ok) {
     trackPendingRequest(model, provider, connectionId, false, true);
+    if (slotAcquired) releaseSlot(provider);
     const { statusCode, message, resetsAtMs } = await parseUpstreamError(providerResponse, executor);
     appendRequestLog({ model, provider, connectionId, status: `FAILED ${statusCode}` }).catch(() => { });
     saveRequestDetail(buildRequestDetail({
@@ -310,7 +340,11 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
 
   const sharedCtx = { provider, model, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess };
   const appendLog = (extra) => appendRequestLog({ model, provider, connectionId, ...extra }).catch(() => { });
-  const trackDone = () => trackPendingRequest(model, provider, connectionId, false);
+  // Release the concurrency slot when the request completes (covers streaming + non-streaming + disconnect)
+  const trackDone = () => {
+    trackPendingRequest(model, provider, connectionId, false);
+    if (slotAcquired) releaseSlot(provider);
+  };
 
   // Provider forced streaming but client wants JSON
   if (!clientRequestedStreaming && providerRequiresStreaming) {

@@ -63,6 +63,7 @@ export default function ProviderDetailPage() {
   const [providerStrategy, setProviderStrategy] = useState(null);
   const [providerStickyLimit, setProviderStickyLimit] = useState("");
   const [thinkingMode, setThinkingMode] = useState("auto");
+  const [concurrencyLimit, setConcurrencyLimit] = useState("");
   const [autoPing, setAutoPing] = useState({ enabled: false, connections: {} });
   const [suggestedModels, setSuggestedModels] = useState([]);
   const [kiloFreeModels, setKiloFreeModels] = useState([]);
@@ -278,6 +279,9 @@ export default function ProviderDetailPage() {
       // Load per-provider thinking config
       const thinkingCfg = (settingsData.providerThinking || {})[providerId] || {};
       setThinkingMode(thinkingCfg.mode || "auto");
+      // Load per-provider concurrency limit
+      const cLimit = (settingsData.providerConcurrencyLimits || {})[providerId];
+      setConcurrencyLimit(cLimit != null ? String(cLimit) : "");
       const autoPingSettingsKey = AUTO_PING_SETTINGS_KEYS[providerId];
       const apCfg = autoPingSettingsKey ? settingsData[autoPingSettingsKey] || {} : {};
       setAutoPing({ enabled: apCfg.enabled === true, connections: apCfg.connections || {} });
@@ -391,6 +395,33 @@ export default function ProviderDetailPage() {
   const handleThinkingModeChange = (mode) => {
     setThinkingMode(mode);
     saveThinkingConfig(mode);
+  };
+
+  const saveConcurrencyLimit = async (value) => {
+    try {
+      const settingsRes = await fetch("/api/settings", { cache: "no-store" });
+      const settingsData = settingsRes.ok ? await settingsRes.json() : {};
+      const current = settingsData.providerConcurrencyLimits || {};
+      const updated = { ...current };
+      const numVal = parseInt(value, 10);
+      if (value && Number.isFinite(numVal) && numVal > 0) {
+        updated[providerId] = numVal;
+      } else {
+        delete updated[providerId];
+      }
+      await fetch("/api/settings", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ providerConcurrencyLimits: updated }),
+      });
+    } catch (error) {
+      console.log("Error saving concurrency limit:", error);
+    }
+  };
+
+  const handleConcurrencyLimitChange = (value) => {
+    setConcurrencyLimit(value);
+    saveConcurrencyLimit(value);
   };
 
   const saveAutoPing = async (next) => {
@@ -1430,6 +1461,18 @@ export default function ProviderDetailPage() {
                     />
                   </div>
                 )}
+              </div>
+              {/* Per-provider concurrency limit */}
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-text-muted font-medium">Max Concurrent</span>
+                <input
+                  type="number"
+                  min={0}
+                  value={concurrencyLimit}
+                  onChange={(e) => handleConcurrencyLimitChange(e.target.value)}
+                  placeholder="∞"
+                  className="w-16 px-2 py-1 text-xs border border-border rounded-md bg-background focus:outline-none focus:border-primary"
+                />
               </div>
             </div>
           </div>

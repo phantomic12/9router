@@ -42,6 +42,9 @@ const DEFAULT_SETTINGS = {
   cavemanLevel: "full",
   ponytailEnabled: false,
   ponytailLevel: "full",
+  // Per-provider concurrency limits: { "umans": 4, "openai": 2 }
+  // 0 or missing = unlimited. Limits concurrent in-flight upstream requests.
+  providerConcurrencyLimits: {},
 };
 
 async function readRaw() {
